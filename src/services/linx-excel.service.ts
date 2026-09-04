@@ -1,10 +1,25 @@
 import type ExcelJSNamespace from 'exceljs';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Product } from '../types/product';
 import { HttpError } from '../utils/http-error';
 
 export const TEMPLATE_PATH = path.resolve(process.cwd(), 'templates/Exportacao de Produtos Linx - Template.xlsx');
 const PRODUCT_SHEET = 'PRODUTOS';
+
+/**
+ * O template tem ~4,8 MB. Lê-lo do disco (ou do compartilhamento de rede) a
+ * cada export/download é caro, então o conteúdo fica em memória após o
+ * primeiro acesso.
+ */
+let templateBytes: Promise<Buffer> | undefined;
+export function readTemplateBytes(): Promise<Buffer> {
+  templateBytes ??= fs.readFile(TEMPLATE_PATH).catch((error) => {
+    templateBytes = undefined;
+    throw new HttpError(500, `Template do Linx não encontrado em ${TEMPLATE_PATH}.`, { cause: String(error) });
+  });
+  return templateBytes;
+}
 
 /**
  * O exceljs sozinho carrega ~460 arquivos. Como só os endpoints de
@@ -34,53 +49,103 @@ const columns = [
   'Exibir condição no site?','Quantidade por embalagem','Unidade de medida','Programa de pontos?','Pontuação',
 ] as const;
 
-/** Lê a linha 1 da aba e devolve os títulos na ordem real das colunas. */
-function readHeaders(sheet: ExcelJSNamespace.Worksheet): string[] {
+type CellValue = ExcelJSNamespace.Cell['value'];
+
+/**
+ * Texto legível de uma célula, cobrindo rich text, hyperlink e fórmula.
+ * Devolve '' para conteúdo que o exceljs não conseguiu interpretar — é isso que
+ * permite detectar um cabeçalho ilegível em vez de comparar '[object Object]'.
+ */
+function cellText(value: CellValue): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value instanceof Date) return value.toISOString();
+
+  if (typeof value === 'object') {
+    const candidate = value as { richText?: { text?: string }[]; text?: unknown; result?: unknown };
+    if (Array.isArray(candidate.richText)) {
+      return candidate.richText.map((part) => part.text ?? '').join('').trim();
+    }
+    if (typeof candidate.text === 'string') return candidate.text.trim();
+    if (candidate.result !== undefined && candidate.result !== null) return String(candidate.result).trim();
+  }
+  return '';
+}
+
+/**
+ * Mapeia cada coluna esperada para o índice (1-based) em que ela está na aba.
+ *
+ * O template oficial do Linx grava o cabeçalho como shared string com namespace
+ * prefixado (<d:t>), formato que o exceljs não interpreta: as células da linha 1
+ * chegam como objeto vazio. Quando todo o cabeçalho está ilegível assim,
+ * assumimos o layout canônico posicional; se o cabeçalho é legível, ele manda.
+ */
+function resolveColumnIndexes(sheet: ExcelJSNamespace.Worksheet, context: string): Map<string, number> {
   const headers: string[] = [];
   sheet.getRow(1).eachCell({ includeEmpty: true }, (cell, col) => {
-    headers[col - 1] = String(cell.value ?? '').trim();
+    headers[col - 1] = cellText(cell.value);
   });
-  return headers;
-}
 
-function assertAllColumns(headers: string[], context: string) {
-  const present = new Set(headers);
-  const missing = columns.filter((column) => !present.has(column));
-  if (missing.length) {
-    throw new HttpError(422, `${context} Colunas ausentes: ${missing.join(', ')}`, { missingColumns: missing });
+  const byName = new Map<string, number>();
+  headers.forEach((header, index) => {
+    if (header && !byName.has(header)) byName.set(header, index + 1);
+  });
+
+  const missing = columns.filter((column) => !byName.has(column));
+  if (!missing.length) {
+    return new Map(columns.map((column) => [column, byName.get(column)!]));
   }
+
+  const readable = headers.filter(Boolean).length;
+  const width = Math.max(sheet.columnCount, headers.length);
+  if (readable === 0 && width >= columns.length) {
+    return new Map(columns.map((column, index) => [column, index + 1]));
+  }
+
+  throw new HttpError(422, `${context} Colunas ausentes: ${missing.join(', ')}`, { missingColumns: missing });
 }
 
+/**
+ * Monta a planilha do zero em vez de editar o template.
+ *
+ * O template oficial dispara três incompatibilidades do exceljs, todas
+ * silenciosas: (1) o cabeçalho vem como shared string com namespace prefixado e
+ * é lido como objeto vazio, (2) ao regravar, esse objeto vira o texto literal
+ * "[object Object]" em todas as colunas do cabeçalho e (3) spliceRows não
+ * remove linhas finais — `spliceRows(2, rowCount - 1)` não apagava nenhuma das
+ * ~6.500 linhas de exemplo, que iam junto no arquivo exportado.
+ *
+ * Gerar o arquivo também deixa o export ordens de grandeza mais rápido: o
+ * template tem 4,8 MB e ~24 MB de shared strings para interpretar.
+ * O arquivo original continua disponível em GET /api/linx/template.
+ */
 export async function exportProducts(products: Product[]) {
   const ExcelJS = await loadExcelJs();
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.readFile(TEMPLATE_PATH);
-  const sheet = workbook.getWorksheet(PRODUCT_SHEET);
-  if (!sheet) throw new HttpError(500, `Aba ${PRODUCT_SHEET} não encontrada no template.`);
+  workbook.creator = 'linx-commerce-test-api';
+  workbook.created = new Date();
 
-  const headers = readHeaders(sheet);
-  assertAllColumns(headers, 'Template de exportação inválido.');
+  const sheet = workbook.addWorksheet(PRODUCT_SHEET, {
+    views: [{ state: 'frozen', ySplit: 1 }],
+  });
 
-  // Captura o estilo da primeira linha de dados antes de limpar o template.
-  const styleTemplate = headers.map((_, i) => ({ ...sheet.getRow(2).getCell(i + 1).style }));
-  const templateHeight = sheet.getRow(2).height;
+  sheet.columns = columns.map((column) => ({
+    header: column,
+    key: column,
+    width: Math.min(Math.max(column.length + 2, 12), 45),
+  }));
 
-  // Remove as linhas de exemplo/dados do template, preservando o cabeçalho.
-  if (sheet.rowCount > 1) sheet.spliceRows(2, sheet.rowCount - 1);
+  const header = sheet.getRow(1);
+  header.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF111111' } };
+  header.alignment = { vertical: 'middle' };
 
   for (const product of products) {
     const values = productToLinxRow(product);
-    // addRow com objeto depende de `column.key`, que uma planilha lida de
-    // arquivo não possui — nesse caso a linha sairia totalmente em branco.
-    // Por isso montamos um array posicional seguindo o cabeçalho real.
-    const row = sheet.addRow(headers.map((header) => values[header] ?? ''));
-    row.height = templateHeight;
-    for (let c = 1; c <= headers.length; c++) {
-      row.getCell(c).style = { ...styleTemplate[c - 1] };
-    }
+    sheet.addRow(columns.map((column) => values[column] ?? ''));
   }
 
-  sheet.views = [{ state: 'frozen', ySplit: 1 }];
   return workbook.xlsx.writeBuffer();
 }
 
@@ -96,24 +161,23 @@ export async function importProducts(buffer: Buffer) {
   const sheet = workbook.getWorksheet(PRODUCT_SHEET);
   if (!sheet) throw new HttpError(422, `Aba ${PRODUCT_SHEET} não encontrada na planilha enviada.`);
 
-  const headers = readHeaders(sheet);
-  assertAllColumns(headers, 'Planilha fora do layout do Linx.');
-
-  const headerMap = new Map<string, number>();
-  headers.forEach((header, index) => {
-    if (header && !headerMap.has(header)) headerMap.set(header, index + 1);
-  });
+  const indexes = resolveColumnIndexes(sheet, 'Planilha fora do layout do Linx.');
 
   const rows: Record<string, unknown>[] = [];
+  const texts: Record<string, string>[] = [];
   const rowNumbers: number[] = [];
   for (let i = 2; i <= sheet.rowCount; i++) {
     const row = sheet.getRow(i);
     if (!row.hasValues) continue;
     const item: Record<string, unknown> = {};
-    for (const column of columns) {
-      item[column] = row.getCell(headerMap.get(column)!).value ?? '';
+    const text: Record<string, string> = {};
+    for (const [column, index] of indexes) {
+      const value = row.getCell(index).value;
+      item[column] = value ?? '';
+      text[column] = cellText(value);
     }
     rows.push(item);
+    texts.push(text);
     rowNumbers.push(i);
   }
 
@@ -121,11 +185,11 @@ export async function importProducts(buffer: Buffer) {
     sheet: PRODUCT_SHEET,
     rowsRead: rows.length,
     rows,
-    validation: validateRows(rows, rowNumbers),
+    validation: validateRows(texts, rowNumbers),
   };
 }
 
-function validateRows(rows: Record<string, unknown>[], rowNumbers: number[]) {
+function validateRows(rows: Record<string, string>[], rowNumbers: number[]) {
   const required = [
     'ID de Integração Produto','Nome do Produto','Código Referência Produto','Definição','Marca',
     'Categoria Principal','Categoria','Exibir no site?','Pode ser pesquisado?','Exibir preço na loja?',
@@ -136,7 +200,7 @@ function validateRows(rows: Record<string, unknown>[], rowNumbers: number[]) {
   const errors: { row: number; field: string; message: string }[] = [];
   rows.forEach((row, index) => {
     for (const field of required) {
-      if (String(row[field] ?? '').trim() === '') {
+      if ((row[field] ?? '').trim() === '') {
         // Linhas vazias no meio da planilha são puladas, então o número real da
         // linha vem de rowNumbers e não de index + 2.
         errors.push({ row: rowNumbers[index] ?? index + 2, field, message: 'Campo obrigatório não preenchido.' });

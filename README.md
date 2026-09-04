@@ -331,11 +331,37 @@ Isso mantém a integração externa isolada e segura.
 npm test
 ```
 
-Build:
+Verificação de tipos e lint:
 
 ```bash
-npm run build
+npm run typecheck
+npm run lint
 ```
+
+Build e execução compilada:
+
+```bash
+npm run build   # gera dist/ a partir de src/ (tsconfig.build.json)
+npm start       # node dist/server.js
+```
+
+## Cache das respostas (304 no Swagger)
+
+Fora de produção a API desliga o ETag e responde `Cache-Control: no-store`.
+Sem isso o navegador revalida com `If-None-Match`, o Express responde
+`304 Not Modified` e o Swagger UI mostra a chamada sem body. Em produção o
+ETag continua ligado, porque ali o cache condicional é útil.
+
+## Tempo de inicialização
+
+`mssql` e `exceljs` são carregados sob demanda (o primeiro só quando
+`DATA_SOURCE=sqlserver`, o segundo só nos endpoints de export/import). Juntos
+são ~900 arquivos que não entram mais no caminho de boot.
+
+Se a subida continuar lenta, o gargalo é o I/O de módulos: rodar o projeto a
+partir de um compartilhamento de rede (ou sem exclusão de antivírus para a
+pasta) faz cada arquivo de `node_modules` custar dezenas de milissegundos.
+Manter o projeto em disco local e excluir a pasta do scan resolve.
 
 ## Arquivos importantes
 

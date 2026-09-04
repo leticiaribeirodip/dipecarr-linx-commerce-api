@@ -1,9 +1,7 @@
 import { Request, Response } from 'express';
-import fs from 'node:fs/promises';
 import { ProductService } from '../services/product.service';
-import { exportProducts, importProducts, TEMPLATE_PATH } from '../services/linx-excel.service';
+import { exportProducts, importProducts, readTemplateBytes } from '../services/linx-excel.service';
 import { parseBoundedInt } from '../utils/numbers';
-import { HttpError } from '../utils/http-error';
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
@@ -12,9 +10,7 @@ export function createLinxController(service: ProductService) {
 
   return {
     template: async (_req: Request, res: Response) => {
-      const file = await fs.readFile(TEMPLATE_PATH).catch(() => {
-        throw new HttpError(500, 'Template do Linx não encontrado em templates/.');
-      });
+      const file = await readTemplateBytes();
       res.setHeader('Content-Type', XLSX_MIME);
       res.setHeader('Content-Disposition', 'attachment; filename="linx-commerce-template.xlsx"');
       return res.send(file);
